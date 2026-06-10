@@ -40,6 +40,8 @@ HEADERS = {
 
 PRICE_RE = re.compile(r"£\s?\d+\.?\d{0,2}")
 
+JS_DETECTION_THRESHOLD = 500
+
 OUTPUT_COLUMNS = [
     "venue_name",
     "brand",
@@ -95,18 +97,37 @@ def build_row(
 def fetch_html(url: str) -> BeautifulSoup:
     """
     Fetch an HTML page and return a BeautifulSoup object.
-    Raises requests.exceptions.HTTPError on 4xx / 5xx responses.
+
+    Automatically detects JavaScript-rendered pages:
+    - Tries requests first (fast, no browser needed)
+    - If the page returns too little content, retries with Selenium
+    - No js_render column needed in venues.csv
     """
+    # ── attempt 1: plain requests ────────────────────────────────
     response = requests.get(url, headers=HEADERS, timeout=15)
     response.raise_for_status()
 
     soup = BeautifulSoup(response.text, "html.parser")
-
-    # Remove noise — scripts and styles pollute the extracted text
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
 
-    return soup
+    # Check how much real text content we got
+    page_text = soup.get_text(separator=" ", strip=True)
+
+    if len(page_text) >= JS_DETECTION_THRESHOLD:
+        # Enough content — requests worked fine
+        return soup
+
+    # ── attempt 2: Selenium fallback ─────────────────────────────
+    print("(JS detected — retrying with Selenium...)", end=" ", flush=True)
+
+    if not SELENIUM_AVAILABLE:
+        raise ImportError(
+            "Page appears JavaScript-rendered but Selenium is not installed.\n"
+            "Run: pip install selenium webdriver-manager"
+        )
+
+    return fetch_html_selenium(url)
 
 
 def fetch_pdf_bytes(url: str) -> bytes:
@@ -177,8 +198,13 @@ def extract_from_html(
     Walk every HTML element. If the element's text contains a £ price
     and has no child elements that also contain a price (to avoid
     duplicating parent + child), record it as a row.
+
+    For each price-bearing element, also searches sibling and parent
+    elements for the product name — handles sites like Waitrose where
+    the name and price are in separate tags.
     """
     rows = []
+    seen = set()  # deduplicate by (item_name, price) pairs
 
     for element in soup.find_all(True):
         text = element.get_text(separator=" ", strip=True)
@@ -187,7 +213,7 @@ def extract_from_html(
         if not price_match:
             continue
 
-        # Skip container elements — only keep the innermost price-bearing tag
+        # Skip container elements — only keep innermost price-bearing tag
         children_with_price = [
             child for child in element.find_all(True)
             if PRICE_RE.search(child.get_text())
@@ -197,14 +223,53 @@ def extract_from_html(
 
         price = price_match.group(0).strip()
 
-        # Item name = everything before the £ sign in this element's text
+        # ── attempt 1: item name is in the same element, before the £ ──
         item_name = text[: text.find(price)].strip(" -|:,\n")
-        if not item_name:
-            item_name = text  # fallback to full text if nothing precedes the price
 
-        # Skip rows where item name is very short or looks like boilerplate
-        if len(item_name) < 3:
+        # ── attempt 2: item name is in a previous sibling element ───────
+        if not item_name or len(item_name) < 3:
+            for sibling in element.find_previous_siblings():
+                sibling_text = sibling.get_text(separator=" ", strip=True)
+                # Skip siblings that are themselves prices or boilerplate
+                if PRICE_RE.search(sibling_text):
+                    continue
+                if sibling_text and len(sibling_text) >= 3:
+                    item_name = sibling_text
+                    break
+
+        # ── attempt 3: item name is in the parent element's own text ────
+        if not item_name or len(item_name) < 3:
+            parent = element.find_parent()
+            if parent:
+                parent_text = parent.get_text(separator=" ", strip=True)
+                candidate = parent_text[: parent_text.find(price)].strip(" -|:,\n")
+                if len(candidate) >= 3:
+                    item_name = candidate
+
+        # Skip if still no meaningful name found
+        if not item_name or len(item_name) < 3:
             continue
+
+        # Skip boilerplate phrases that are not product names
+        BOILERPLATE = {
+            "price per unit", "was", "any 3 for", "any 2 for",
+            "any 4 for", "save", "offer", "now", "from",
+        }
+        if item_name.lower().strip() in BOILERPLATE:
+            continue
+
+        # Skip if item_name is itself just a price
+        if PRICE_RE.fullmatch(item_name.strip()):
+            continue
+
+        # Clean trailing prepositions e.g. "Bacon Roll & Hot Drink for"
+        item_name = re.sub(r"\s+(for|at|from|was|now)\s*$", "", item_name, flags=re.IGNORECASE).strip()
+
+        # Deduplicate
+        key = (item_name.lower(), price)
+        if key in seen:
+            continue
+        seen.add(key)
 
         rows.append(
             build_row(venue_name, location, url, item_name, price, "html_menu")
@@ -321,13 +386,10 @@ def load_venues(csv_path: str) -> list[dict]:
                 or url.split("/")[2]
             )
 
-            js_render = row.get("js_render", "no").strip().lower() == "yes"
-
             venues.append({
                 "venue_name": venue_name,
                 "url":        url,
                 "location":   location,
-                "js_render":  js_render,
             })
 
     return venues
@@ -388,15 +450,12 @@ def main():
         name     = venue["venue_name"]
         url      = venue["url"]
         location = venue["location"]
-        pdf       = is_pdf(url)
-        js_render = venue.get("js_render", False)
-
-        fetch_type = "pdf_menu" if pdf else ("js_render" if js_render else "html_menu")
+        pdf = is_pdf(url)
 
         print(f"[{i}/{len(venues)}]  {name}")
         print(f"  location : {location}")
         print(f"  url      : {url}")
-        print(f"  type     : {fetch_type}")
+        print(f"  type     : {'pdf_menu' if pdf else 'html_menu (auto-detect JS)'}")
 
         try:
             if pdf:
@@ -406,14 +465,6 @@ def main():
 
                 print("  extracting...", end=" ", flush=True)
                 rows = extract_from_pdf(pdf_bytes, url, name, location)
-
-            elif js_render:
-                print("  fetching with Selenium...", end=" ", flush=True)
-                soup = fetch_html_selenium(url)
-                print("done")
-
-                print("  extracting...", end=" ", flush=True)
-                rows = extract_from_html(soup, url, name, location)
 
             else:
                 print("  fetching HTML...", end=" ", flush=True)
