@@ -1,0 +1,12 @@
+#Output data -  not committed to Git 
+output/
+
+#Python
+_ _pycache_ _/
+*._pyc
+.env
+
+
+# OS
+.DS_Store
+Thumbs.db
