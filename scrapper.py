@@ -9,6 +9,17 @@ import requests
 import pdfplumber
 from bs4 import BeautifulSoup
 
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+    from webdriver_manager.chrome import ChromeDriverManager
+    SELENIUM_AVAILABLE = True
+except ImportError:
+    SELENIUM_AVAILABLE = False
+
 
 # =============================================================================
 # CONFIG
@@ -103,7 +114,54 @@ def fetch_pdf_bytes(url: str) -> bytes:
     response = requests.get(url, headers=HEADERS, timeout=20)
     response.raise_for_status()
     return response.content
+def fetch_html_selenium(url: str) -> BeautifulSoup:
+    """
+    Fetch a JavaScript-rendered page using headless Chrome.
+    Use this for sites that return empty content with requests
+    e.g. Waitrose, Flight Club, Electric Shuffle.
+    """
+    if not SELENIUM_AVAILABLE:
+        raise ImportError(
+            "Selenium not installed. Run: pip install selenium webdriver-manager"
+        )
 
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options,
+    )
+
+    try:
+        driver.get(url)
+
+        # Wait up to 15 seconds for any paragraph to appear
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "p"))
+        )
+
+        # Extra wait for slow sites that lazy-load prices
+        time.sleep(3)
+
+        html = driver.page_source
+
+    finally:
+        driver.quit()
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    return soup
 
 # =============================================================================
 # EXTRACTORS
@@ -263,10 +321,13 @@ def load_venues(csv_path: str) -> list[dict]:
                 or url.split("/")[2]
             )
 
+            js_render = row.get("js_render", "no").strip().lower() == "yes"
+
             venues.append({
                 "venue_name": venue_name,
                 "url":        url,
                 "location":   location,
+                "js_render":  js_render,
             })
 
     return venues
@@ -327,12 +388,15 @@ def main():
         name     = venue["venue_name"]
         url      = venue["url"]
         location = venue["location"]
-        pdf      = is_pdf(url)
+        pdf       = is_pdf(url)
+        js_render = venue.get("js_render", False)
+
+        fetch_type = "pdf_menu" if pdf else ("js_render" if js_render else "html_menu")
 
         print(f"[{i}/{len(venues)}]  {name}")
         print(f"  location : {location}")
         print(f"  url      : {url}")
-        print(f"  type     : {'pdf_menu' if pdf else 'html_menu'}")
+        print(f"  type     : {fetch_type}")
 
         try:
             if pdf:
@@ -342,6 +406,14 @@ def main():
 
                 print("  extracting...", end=" ", flush=True)
                 rows = extract_from_pdf(pdf_bytes, url, name, location)
+
+            elif js_render:
+                print("  fetching with Selenium...", end=" ", flush=True)
+                soup = fetch_html_selenium(url)
+                print("done")
+
+                print("  extracting...", end=" ", flush=True)
+                rows = extract_from_html(soup, url, name, location)
 
             else:
                 print("  fetching HTML...", end=" ", flush=True)
