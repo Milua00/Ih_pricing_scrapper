@@ -72,6 +72,13 @@ PRICE_RE      = re.compile(r"£\s?(\d+(?:\.\d{1,2})?)")
 # an ABV ("4.6%") or a calorie figure ("464Kcal")
 BARE_PRICE_RE = re.compile(r"\b(\d{1,3}\.\d{2})\b(?!\s*%|\s*[Kk]cal)")
 KCAL_RE       = re.compile(r"\d+\s*[Kk]cal")
+# Integer-priced block menus (Electric Shuffle style): price alone on a
+# line ("9", "7 / 12"), or trailing/leading a text line.
+INT_PRICE_LINE_RE  = re.compile(r"^\s*(\d{1,2})(?:\s*/\s*(\d{1,2}))?\s*$")
+TRAILING_INT_RE    = re.compile(r"(?<=[a-zA-Z)\u00e9])\s+(\d{1,2})\s*$")
+LEADING_INT_RE     = re.compile(r"^\s*(\d{1,2})\s+(?=[A-Z\u00c0-\u00dc])")
+DIET_TAG_RE        = re.compile(
+    r"(?:\s+(?:V|Ve|Ve\*|VG|NGC|GF|DF|N|H))+\s*$")
 SERVE_SIZE_RE = re.compile(
     r"\b(glass|pint|half pint|bottle|can|\d+\s?(?:ml|cl|l))\b", re.IGNORECASE)
 PER_KG_RE     = re.compile(r"£\s?\d+(?:\.\d{1,2})?\s*(?:/|per\s*)kg", re.IGNORECASE)
@@ -150,6 +157,8 @@ def clean_name(name: str) -> str:
                   flags=re.IGNORECASE).strip()
     # dangling multibuy fragments: "Kids' Meals (5 for", "Pies (2 for )"
     name = re.sub(r"\(\s*\d*\s*(?:for)?\s*\)?\s*$", "", name).strip(" -–|:,.")
+    # dietary tags: "Buffalo V NGC" -> "Buffalo"
+    name = DIET_TAG_RE.sub("", name).strip(" -–|:,.")
     return name
 
 
@@ -890,9 +899,14 @@ def _line_prices(line: str, use_bare: bool) -> list:
 
 
 def _is_section_header(line: str) -> bool:
-    """ALL-CAPS short lines with no price are section headers."""
+    """ALL-CAPS short lines with no price are section headers.
+    Must contain letters — otherwise bare price lines like "9" match,
+    since "9" == "9".upper()."""
     s = line.strip()
-    return bool(s) and len(s) < 45 and s == s.upper() and not BARE_PRICE_RE.search(s)
+    return (bool(s) and len(s) < 45 and s == s.upper()
+            and bool(re.search(r"[A-Z]", s))
+            and not BARE_PRICE_RE.search(s)
+            and not INT_PRICE_LINE_RE.match(s))
 
 
 def _pdf_description(lines: list, idx: int, use_bare: bool) -> str:
@@ -972,6 +986,109 @@ def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
     return count
 
 
+NOISE_LINE_RE = re.compile(
+    r"per portion|service charge|allergen|calories|registered charity|"
+    r"subject to change|gluten free|please|look out for|goes directly",
+    re.IGNORECASE,
+)
+
+
+def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
+    """Block-style menus where the price is a bare integer on its own
+    line AFTER the name and description:
+
+        Buffalo V NGC          <- name
+        Ranch dressing         <- description
+        9                      <- price
+
+    Also handles inline integers ("Waffle fries Ve NGC 5"), dual prices
+    ("7 / 12"), and two-column extraction artefacts where the previous
+    item's price fuses onto the next name ("7 Sweet tooth brioche buns").
+    """
+    count = 0
+    pend_name, pend_desc = "", []
+
+    def reset():
+        nonlocal pend_name, pend_desc
+        pend_name, pend_desc = "", []
+
+    def close(prices, sizes=None):
+        nonlocal count
+        if not pend_name:
+            return
+        desc = ", ".join(pend_desc)[:300]
+        for j, p in enumerate(prices):
+            size = (sizes[j] if sizes and j < len(sizes) else "")
+            if collector.add(pend_name, p, size=size, description=desc):
+                count += 1
+        reset()
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        # long prose / footer noise resets any half-built item
+        if len(line) > 110 or NOISE_LINE_RE.search(line):
+            reset()
+            continue
+        if _is_section_header(line):
+            reset()
+            continue
+
+        # "9"  or  "7 / 12"  alone on the line -> closes the pending item
+        m = INT_PRICE_LINE_RE.match(line)
+        if m:
+            prices = [m.group(1)] + ([m.group(2)] if m.group(2) else [])
+            close(prices)
+            continue
+
+        # "7 Sweet tooth brioche buns V" -> price 7 closes pending,
+        # remainder starts the next item
+        m = LEADING_INT_RE.match(line)
+        if m:
+            close([m.group(1)])
+            line = line[m.end():].strip()
+            if line:
+                pend_name = line
+            continue
+
+        # "Waffle fries Ve NGC 5" -> complete single-line item
+        m = TRAILING_INT_RE.search(line)
+        if m and not pend_name:
+            name_part = line[: m.start()].strip()
+            if collector.add(name_part, m.group(1)):
+                count += 1
+            continue
+        if m and pend_name:
+            # pending item never got a price (column break) — discard it,
+            # this line is a complete item of its own
+            reset()
+            name_part = line[: m.start()].strip()
+            if collector.add(name_part, m.group(1)):
+                count += 1
+            continue
+
+        # £-prices on a text line still work in block menus
+        pm = PRICE_RE.search(line)
+        if pm:
+            reset()
+            name_part = line[: pm.start()].strip(" -–|:,")
+            if len(clean_name(name_part)) >= MIN_NAME_LEN:
+                if collector.add(name_part, pm.group(0)):
+                    count += 1
+            continue
+
+        # otherwise: first text line = name, later ones = description
+        if not pend_name:
+            pend_name = line
+        else:
+            pend_desc.append(line)
+            if len(pend_desc) > 3:        # runaway block, not an item
+                reset()
+
+    return count
+
+
 def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
     collector = RowCollector(venue_name, location, url, "pdf_menu")
 
@@ -995,7 +1112,17 @@ def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
                 continue
 
             lines = (page.extract_text() or "").splitlines()
-            _extract_pdf_lines(lines, collector)
+
+            # Choose parser: block mode when the page is full of
+            # standalone-integer price lines and (almost) no £ / d.dd
+            pound = sum(1 for ln in lines if PRICE_RE.search(ln))
+            dec   = sum(1 for ln in lines if BARE_PRICE_RE.search(ln))
+            ints  = sum(1 for ln in lines if INT_PRICE_LINE_RE.match(ln.strip())
+                        or TRAILING_INT_RE.search(ln.strip()))
+            if pound < 3 and dec < 3 and ints >= 4:
+                _extract_pdf_blocks(lines, collector)
+            else:
+                _extract_pdf_lines(lines, collector)
 
     return collector.rows
 
@@ -1022,10 +1149,14 @@ def load_venues(csv_path: str) -> list[dict]:
             if not location:
                 print(f"  [row {i}] Skipped — missing location")
                 continue
+            # Multiple locations per venue: separated by ';' or '|'
+            # e.g.  "Newcastle; Leeds; Manchester"
+            locations = [loc.strip() for loc in re.split(r"[;|]", location)
+                         if loc.strip()]
             venue_name = (row.get("venue_name") or row.get("name")
                           or url.split("/")[2])
             venues.append({"venue_name": venue_name, "url": url,
-                           "location": location})
+                           "locations": locations})
     return venues
 
 
@@ -1077,12 +1208,15 @@ def main():
     total_rows, errors = 0, []
 
     for i, venue in enumerate(venues, start=1):
-        name, url, location = venue["venue_name"], venue["url"], venue["location"]
+        name, url = venue["venue_name"], venue["url"]
+        locations = venue["locations"]
+        location = locations[0]          # scrape under the first location
         pdf = is_pdf(url)
 
         print(f"[{i}/{len(venues)}]  {name}")
-        print(f"  url  : {url}")
-        print(f"  type : {'pdf_menu' if pdf else 'html_menu'}")
+        print(f"  url       : {url}")
+        print(f"  locations : {', '.join(locations)}")
+        print(f"  type      : {'pdf_menu' if pdf else 'html_menu'}")
 
         try:
             if pdf:
@@ -1101,7 +1235,19 @@ def main():
                     soup, _ = fetch_html_selenium(url)
                     rows = extract_from_html(soup, url, name, location)
 
-            print(f"{len(rows)} rows")
+            # Fan out: one copy of every row per location. The menu is
+            # fetched once; only the location column differs.
+            if rows and len(locations) > 1:
+                expanded = []
+                for loc in locations:
+                    for row in rows:
+                        r = dict(row)
+                        r["location"] = loc
+                        expanded.append(r)
+                rows = expanded
+
+            print(f"{len(rows)} rows"
+                  + (f" ({len(locations)} locations)" if len(locations) > 1 else ""))
 
             if rows:
                 save_rows(rows, output_path)
@@ -1144,4 +1290,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
