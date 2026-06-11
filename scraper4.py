@@ -68,6 +68,12 @@ HEADERS = {
 }
 
 PRICE_RE      = re.compile(r"£\s?(\d+(?:\.\d{1,2})?)")
+# Bare menu prices ("PORNSTAR MARTINI 11.45") — strict d.dd, must NOT be
+# an ABV ("4.6%") or a calorie figure ("464Kcal")
+BARE_PRICE_RE = re.compile(r"\b(\d{1,3}\.\d{2})\b(?!\s*%|\s*[Kk]cal)")
+KCAL_RE       = re.compile(r"\d+\s*[Kk]cal")
+SERVE_SIZE_RE = re.compile(
+    r"\b(glass|pint|half pint|bottle|can|\d+\s?(?:ml|cl|l))\b", re.IGNORECASE)
 PER_KG_RE     = re.compile(r"£\s?\d+(?:\.\d{1,2})?\s*(?:/|per\s*)kg", re.IGNORECASE)
 SIZE_RE       = re.compile(
     r"\b(\d+(?:\.\d+)?\s?(?:g|kg|ml|cl|l|litre|oz)|x\s?\d+|\d+\s?(?:pack|pieces|pcs))\b",
@@ -194,10 +200,14 @@ def extract_size(name: str) -> tuple[str, str]:
 
 MOCKTAIL_KW = [
     "mocktail", "virgin ", "non-alcoholic", "non alcoholic", "alcohol-free",
-    "alcohol free", "0%", "0.0%", "nosecco",
+    "alcohol free", "0%", "0.0%", "nosecco", "nojito", "lyre's", "lyres",
+    "everleaf", "seedlip", "crossip", "celibate",
 ]
+# ABV of 0.5% or below counts as alcohol-free (UK convention)
+LOW_ABV_RE = re.compile(r"\b0(?:\.[0-5])?\s*%")
 BEER_KW = [
     "beer", "lager", "ipa", " ale", "pale ale", "stout", "pilsner", "cider",
+    "beavertown", "birra", "red stripe", "pacifico", "daura", "shandy",
     "madri", "peroni", "corona", "moretti", "guinness", "carling", "foster",
     "heineken", "stella", "san miguel", "camden", "brewdog", "amstel",
     "estrella", "asahi", "kopparberg", "rekorderlig", "budweiser", "becks",
@@ -216,6 +226,8 @@ COCKTAIL_KW = [
     "sangria", "pimm", "g&t", "gin & tonic", "gin and tonic", "spiked",
     "vodka", "rum ", "tequila", "whisky", "whiskey", "bourbon", "brandy",
     "liqueur", "aperol", "campari", "baileys", "jagermeister", "disaronno",
+    "limoncello", "hooch", "wkd", "smirnoff ice", "baby guinness",
+    "sambuca", "sourz", "jager bomb", "shot", "tequila rose", "spritz",
 ]
 SOFT_KW = [
     "soft drink", "coca-cola", "coca cola", "coke", "pepsi", "lemonade",
@@ -226,6 +238,7 @@ SOFT_KW = [
     "ginger ale", "iced tea", "tea", "coffee", "latte", "cappuccino",
     "espresso", "americano", "mocha", "flat white", "hot chocolate",
     "babyccino", "fruit shoot", "capri sun", "robinsons", "slush",
+    "j20", "j2o", "float", "frobscottle", "oasis", "ribena", "vimto",
 ]
 # unmistakable food words — veto drink classification from the NAME
 # (handles "Rum & Raisin Ice Cream", "Beer-Battered Fish", "Coffee Cake",
@@ -244,6 +257,7 @@ FOOD_VETO_KW = [
 # generic drink words that flag is_drink even if type stays uncertain
 GENERIC_DRINK_KW = [
     "drink", "beverage", "bottle of", "can of", "glass of", "jug of",
+    "draught", "bottle", "on tap",
     "pitcher", "carafe", "175ml", "250ml", "330ml", "440ml", "500ml",
     "70cl", "75cl", "125ml",
 ]
@@ -284,6 +298,10 @@ def classify_drink(name: str, description: str = "") -> tuple[str, str]:
     forces mocktail."""
     name_l = f" {name} ".lower()
     desc_l = f" {description} ".lower()
+
+    # 0.x% ABV anywhere = alcohol-free serve of an alcoholic drink
+    if LOW_ABV_RE.search(name_l) or LOW_ABV_RE.search(desc_l):
+        return "yes", "mocktail"
 
     # 0. unmistakable food word in the name vetoes name-based alcohol
     #    matches ("Rum & Raisin Ice Cream", "Beer-Battered Fish") —
@@ -356,7 +374,8 @@ class RowCollector:
         self.url, self.source_type = url, source_type
         self.rows, self._seen = [], set()
 
-    def add(self, name, price, size="", price_per_kg="", description=""):
+    def add(self, name, price, size="", price_per_kg="", description="",
+            force_food=False):
         name = clean_name(name)
         price = normalise_price(price)
         if not price or not valid_name(name):
@@ -376,7 +395,8 @@ class RowCollector:
             price_per_kg=normalise_price(price_per_kg),
         )
 
-        is_drink, drink_type = classify_drink(name, description)
+        is_drink, drink_type = ("no", "") if force_food else \
+            classify_drink(name, description)
         if is_drink == "yes":
             row["is_drink"] = "yes"
             row["type"] = drink_type
@@ -860,6 +880,98 @@ def extract_from_html(soup, url, venue_name, location) -> list[dict]:
 # PDF PIPELINE
 # =============================================================================
 
+def _line_prices(line: str, use_bare: bool) -> list:
+    """All price matches in a line: £-prefixed always; bare d.dd only in
+    bare mode (menus that omit the currency symbol)."""
+    matches = list(PRICE_RE.finditer(line))
+    if not matches and use_bare:
+        matches = list(BARE_PRICE_RE.finditer(line))
+    return matches
+
+
+def _is_section_header(line: str) -> bool:
+    """ALL-CAPS short lines with no price are section headers."""
+    s = line.strip()
+    return bool(s) and len(s) < 45 and s == s.upper() and not BARE_PRICE_RE.search(s)
+
+
+def _pdf_description(lines: list, idx: int, use_bare: bool) -> str:
+    """The line after a priced item is its description if it carries no
+    price of its own, isn't a section header, and looks like prose."""
+    if idx + 1 >= len(lines):
+        return ""
+    nxt = lines[idx + 1].strip()
+    if not nxt or len(nxt) > 110:
+        return ""
+    if _line_prices(nxt, use_bare) or _is_section_header(nxt):
+        return ""
+    if not re.search(r"[a-z]", nxt):      # no lowercase = header/decoration
+        return ""
+    return nxt
+
+
+def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
+    """Line-based menu parsing. Handles £-prefixed and bare prices,
+    multi-serve lines ("Glass 3.45 / Pint 4.30"), ABV/Kcal noise, and
+    attaches the following line as a description."""
+    # Bare-price mode: only when the text has (almost) no £ symbols but
+    # plenty of price-shaped numbers — prevents false hits in normal docs.
+    pound_hits = sum(1 for ln in lines if PRICE_RE.search(ln))
+    bare_hits  = sum(1 for ln in lines if BARE_PRICE_RE.search(ln))
+    use_bare   = pound_hits < 3 and bare_hits >= 5
+
+    count = 0
+    for i, raw in enumerate(lines):
+        line = re.sub(r"\.{2,}", " ", raw).strip()   # dotted leaders
+        if not line:
+            continue
+        prices = _line_prices(line, use_bare)
+        if not prices:
+            continue
+
+        first = prices[0]
+        has_kcal = bool(KCAL_RE.search(line))
+        name = KCAL_RE.sub("", line[: first.start()]).strip(" -–|:,")
+        if len(clean_name(name)) < MIN_NAME_LEN:
+            continue
+        description = _pdf_description(lines, i, use_bare)
+
+        if len(prices) == 1:
+            if collector.add(name, first.group(0), description=description,
+                             force_food=has_kcal):
+                count += 1
+            continue
+
+        # strip every trailing serve label from the base name once,
+        # so "DRAUGHT Glass 3.45 / Pint 4.30" -> base "DRAUGHT"
+        base_name = name
+        while True:
+            m_tail = None
+            for m_tail in SERVE_SIZE_RE.finditer(base_name):
+                pass
+            if m_tail and base_name.lower().endswith(m_tail.group(0).lower()):
+                base_name = base_name[: m_tail.start()].strip(" -–|:,")
+            else:
+                break
+
+        # Multi-price line: "DRAUGHT Glass 3.45 / Pint 4.30" — pair each
+        # price with the serve-size label immediately before it.
+        prev_end = first.start()
+        # leading name may itself end with a serve label ("... Glass")
+        for m in prices:
+            label_zone = line[: m.start()] if m is first else line[prev_end: m.start()]
+            size_m = None
+            for size_m in SERVE_SIZE_RE.finditer(label_zone):
+                pass                                   # keep the LAST label
+            size = size_m.group(0) if size_m else ""
+            if collector.add(base_name, m.group(0), size=size,
+                             description=description, force_food=has_kcal):
+                count += 1
+            prev_end = m.end()
+
+    return count
+
+
 def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
     collector = RowCollector(venue_name, location, url, "pdf_menu")
 
@@ -879,16 +991,11 @@ def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
                     if collector.add(name, m.group(0)):
                         page_found += 1
 
-            if page_found:        # per-PAGE check (v1 bug: was cumulative)
+            if page_found:        # per-PAGE check
                 continue
 
-            for line in (page.extract_text() or "").splitlines():
-                m = PRICE_RE.search(line)
-                if not m:
-                    continue
-                # dotted-leader menus: "Margherita ........ £9.50"
-                name = re.sub(r"\.{2,}", " ", line[: line.find(m.group(0))])
-                collector.add(name, m.group(0))
+            lines = (page.extract_text() or "").splitlines()
+            _extract_pdf_lines(lines, collector)
 
     return collector.rows
 
@@ -1037,18 +1144,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
