@@ -1,8 +1,8 @@
 """
 IH Solutions — Competitor Pricing Scraper (v2)
-
+ 
 Tiered extraction strategy, most reliable first:
-
+ 
   1. JSON-LD        <script type="application/ld+json"> — schema.org
                     Product / Offer / Menu / MenuItem objects.
   2. Embedded JSON  __NEXT_DATA__, window.__PRELOADED_STATE__, etc.
@@ -14,7 +14,7 @@ Tiered extraction strategy, most reliable first:
                     title-classed element inside that "card".
                     (Replaces the old innermost-element heuristic,
                     which produced "£6.50" / "Price per unit" rows.)
-
+ 
 Other fixes vs v1:
   - "Was £X" / strikethrough prices ignored; current price preferred.
   - "per kg" / "/kg" prices routed to price_per_kg, not food_item.
@@ -25,7 +25,7 @@ Other fixes vs v1:
   - Selenium fallback also triggers when a page has plenty of text
     but zero extractable items (e.g. skeleton screens with copy).
 """
-
+ 
 import csv
 import io
 import json
@@ -33,11 +33,19 @@ import re
 import time
 from datetime import date
 from pathlib import Path
-
+ 
 import requests
 import pdfplumber
 from bs4 import BeautifulSoup, Tag
-
+ 
+try:
+    import pytesseract
+    from PIL import Image, ImageOps
+    from pytesseract import Output
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+ 
 try:
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
@@ -48,16 +56,16 @@ try:
     SELENIUM_AVAILABLE = True
 except ImportError:
     SELENIUM_AVAILABLE = False
-
-
+ 
+ 
 # =============================================================================
 # CONFIG
 # =============================================================================
-
+ 
 INPUT_CSV  = "venues.csv"
 OUTPUT_DIR = Path("output")
 TODAY      = date.today().isoformat()
-
+ 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -66,7 +74,7 @@ HEADERS = {
     ),
     "Accept-Language": "en-GB,en;q=0.9",
 }
-
+ 
 PRICE_RE      = re.compile(r"£\s?(\d+(?:\.\d{1,2})?)")
 # Bare menu prices ("PORNSTAR MARTINI 11.45") — strict d.dd, must NOT be
 # an ABV ("4.6%") or a calorie figure ("464Kcal")
@@ -87,11 +95,11 @@ SIZE_RE       = re.compile(
     re.IGNORECASE,
 )
 WAS_PRICE_RE  = re.compile(r"\bwas\s*£\s?\d+(?:\.\d{1,2})?", re.IGNORECASE)
-
+ 
 JS_DETECTION_THRESHOLD = 500
 MIN_NAME_LEN           = 3
 MAX_NAME_LEN           = 120   # longer = description blob, not a product name
-
+ 
 BOILERPLATE = {
     "price per unit", "was", "now", "from", "save", "offer",
     "any 2 for", "any 3 for", "any 4 for", "add", "add to cart",
@@ -100,7 +108,7 @@ BOILERPLATE = {
     "more details", "quick view", "out of stock", "new", "online only",
     "portion size", "main meals", "menu", "filter", "sort by", "results",
 }
-
+ 
 # Elements inside a card that are likely to hold the product name,
 # in priority order.
 NAME_SELECTORS = [
@@ -113,22 +121,22 @@ NAME_SELECTORS = [
     "a",
     "strong", "b",
 ]
-
+ 
 OUTPUT_COLUMNS = [
     "venue_name", "brand", "location", "food_item", "price",
     "price_per_kg", "size", "is_drink", "type", "drink_item",
     "source_type", "source_url", "ingestion_date",
 ]
-
-
+ 
+ 
 # =============================================================================
 # HELPERS
 # =============================================================================
-
+ 
 def is_pdf(url: str) -> bool:
     return url.lower().split("?")[0].endswith(".pdf")
-
-
+ 
+ 
 def normalise_price(raw) -> str:
     """'£ 6.5', 6.5, '6.50' -> '£6.50'. Returns '' if unparseable/zero."""
     if raw is None:
@@ -144,8 +152,8 @@ def normalise_price(raw) -> str:
     if value <= 0:
         return ""
     return f"£{value:.2f}"
-
-
+ 
+ 
 def clean_name(name: str) -> str:
     """Strip prices, promo phrases and trailing prepositions from a name."""
     if not name:
@@ -160,15 +168,15 @@ def clean_name(name: str) -> str:
     # dietary tags: "Buffalo V NGC" -> "Buffalo"
     name = DIET_TAG_RE.sub("", name).strip(" -–|:,.")
     return name
-
-
+ 
+ 
 KEYLIKE_RE = re.compile(
     r"^[\w.-]+:[\w.-]+$"            # namespaced keys: brxsaas:offerPrices
     r"|^[a-z]+(?:[A-Z][a-zA-Z0-9]*)+$"  # camelCase identifiers
     r"|^[a-z0-9_.-]+$"                # snake/kebab keys with no spaces
 )
-
-
+ 
+ 
 def valid_name(name: str) -> bool:
     if not name:
         return False
@@ -188,8 +196,8 @@ def valid_name(name: str) -> bool:
     if n.lower().startswith(("skip to", "go to", "back to", "sign in", "log in")):
         return False
     return True
-
-
+ 
+ 
 def extract_size(name: str) -> tuple[str, str]:
     """Pull a pack/weight size out of a name. Returns (clean_name, size)."""
     m = SIZE_RE.search(name)
@@ -201,12 +209,12 @@ def extract_size(name: str) -> tuple[str, str]:
     if valid_name(cleaned):
         return cleaned, size
     return name, size
-
-
+ 
+ 
 # ── drink classification ─────────────────────────────────────────────
 # Order matters: mocktail (non-alcoholic markers) must be checked before
 # beer/wine so "Madri 0%" or "Virgin Mojito" don't classify as alcoholic.
-
+ 
 MOCKTAIL_KW = [
     "mocktail", "virgin ", "non-alcoholic", "non alcoholic", "alcohol-free",
     "alcohol free", "0%", "0.0%", "nosecco", "nojito", "lyre's", "lyres",
@@ -262,7 +270,7 @@ FOOD_VETO_KW = [
     "tiramisu", "gateau", "fondant", "crumble", "waffle", "pancake",
     "jus", "butter", "stew", "casserole", "curry",
 ]
-
+ 
 # generic drink words that flag is_drink even if type stays uncertain
 GENERIC_DRINK_KW = [
     "drink", "beverage", "bottle of", "can of", "glass of", "jug of",
@@ -270,19 +278,19 @@ GENERIC_DRINK_KW = [
     "pitcher", "carafe", "175ml", "250ml", "330ml", "440ml", "500ml",
     "70cl", "75cl", "125ml",
 ]
-
+ 
 DRINK_SIZE_RE = re.compile(
     r"\b(\d+(?:\.\d+)?\s?(?:ml|cl|l|ltr|litre|oz)|"
     r"(?:half\s+)?pint|bottle|can|jug|pitcher|carafe|"
     r"small|medium|large)\b",
     re.IGNORECASE,
 )
-
-
+ 
+ 
 def _contains(text: str, keywords: list) -> bool:
     return any(kw in text for kw in keywords)
-
-
+ 
+ 
 def _classify_text(text: str) -> str:
     """Keyword cascade on one piece of text. Mocktail first so '0%' /
     'virgin' overrides alcoholic matches in the same string."""
@@ -297,8 +305,8 @@ def _classify_text(text: str) -> str:
     if _contains(text, SOFT_KW):
         return "softdrinks"
     return ""
-
-
+ 
+ 
 def classify_drink(name: str, description: str = "") -> tuple[str, str]:
     """Return (is_drink, drink_type). The NAME outranks the description:
     'Aperol Spritz' is a cocktail even though its description mentions
@@ -307,17 +315,17 @@ def classify_drink(name: str, description: str = "") -> tuple[str, str]:
     forces mocktail."""
     name_l = f" {name} ".lower()
     desc_l = f" {description} ".lower()
-
+ 
     # 0.x% ABV anywhere = alcohol-free serve of an alcoholic drink
     if LOW_ABV_RE.search(name_l) or LOW_ABV_RE.search(desc_l):
         return "yes", "mocktail"
-
+ 
     # 0. unmistakable food word in the name vetoes name-based alcohol
     #    matches ("Rum & Raisin Ice Cream", "Beer-Battered Fish") —
     #    unless the name ALSO has an explicit drink-format word
     #    ("Bacon Roll & Hot Drink" keeps its drink flag via step 2)
     food_veto = _contains(name_l, FOOD_VETO_KW)
-
+ 
     # 1. the NAME identifies the drink
     if not food_veto and _contains(name_l, MOCKTAIL_KW):
         return "yes", "mocktail"
@@ -327,14 +335,14 @@ def classify_drink(name: str, description: str = "") -> tuple[str, str]:
         if _contains(desc_l, MOCKTAIL_KW):
             return "yes", "mocktail"
         return "yes", drink_type
-
+ 
     # 2. the name carries a generic drink signal ("glass of", "drink",
     #    "175ml"...) — it IS a drink; use the description to type it
     if _contains(name_l, GENERIC_DRINK_KW):
         if _contains(desc_l, MOCKTAIL_KW):
             return "yes", "mocktail"
         return "yes", _classify_text(desc_l)
-
+ 
     # 3. strong drink signal in the DESCRIPTION (bottle/can/ml sizes) —
     #    e.g. an unbranded name like "House Red" with "Merlot 175ml".
     #    Vetoed for clear food names ("Steak" + "served with 25ml jus").
@@ -342,18 +350,18 @@ def classify_drink(name: str, description: str = "") -> tuple[str, str]:
         if _contains(desc_l, MOCKTAIL_KW):
             return "yes", "mocktail"
         return "yes", _classify_text(desc_l)
-
+ 
     return "no", ""
-
-
+ 
+ 
 def extract_drink_size(name: str, description: str = "") -> str:
     for source in (name, description):
         m = DRINK_SIZE_RE.search(source or "")
         if m:
             return m.group(0).strip()
     return ""
-
-
+ 
+ 
 def build_drink_item(name: str, description: str, size: str) -> str:
     parts = [f"name: {name}"]
     if description:
@@ -361,8 +369,8 @@ def build_drink_item(name: str, description: str, size: str) -> str:
     if size:
         parts.append(f"size: {size}")
     return "; ".join(parts)
-
-
+ 
+ 
 def build_row(venue_name, location, url, food_item, price, source_type,
               size="", price_per_kg="") -> dict:
     return {
@@ -373,16 +381,16 @@ def build_row(venue_name, location, url, food_item, price, source_type,
         "source_type": source_type, "source_url": url,
         "ingestion_date": TODAY,
     }
-
-
+ 
+ 
 class RowCollector:
     """Deduplicates and validates rows as they're added."""
-
+ 
     def __init__(self, venue_name, location, url, source_type):
         self.venue_name, self.location = venue_name, location
         self.url, self.source_type = url, source_type
         self.rows, self._seen = [], set()
-
+ 
     def add(self, name, price, size="", price_per_kg="", description="",
             force_food=False):
         name = clean_name(name)
@@ -395,15 +403,15 @@ class RowCollector:
         if key in self._seen:
             return False
         self._seen.add(key)
-
+ 
         description = re.sub(r"\s+", " ", (description or "")).strip()[:300]
-
+ 
         row = build_row(
             self.venue_name, self.location, self.url,
             name, price, self.source_type, size=size,
             price_per_kg=normalise_price(price_per_kg),
         )
-
+ 
         is_drink, drink_type = ("no", "") if force_food else \
             classify_drink(name, description)
         if is_drink == "yes":
@@ -413,51 +421,51 @@ class RowCollector:
             row["drink_item"] = build_drink_item(name, description, drink_size)
             if drink_size and not row["size"]:
                 row["size"] = drink_size
-
+ 
         self.rows.append(row)
         return True
-
-
+ 
+ 
 # =============================================================================
 # FETCHERS
 # =============================================================================
-
+ 
 def fetch_html(url: str) -> tuple[BeautifulSoup, str]:
     """Returns (soup, raw_html). Falls back to Selenium for thin pages."""
     response = requests.get(url, headers=HEADERS, timeout=15)
     response.raise_for_status()
     html = response.text
     soup = make_soup(html)
-
+ 
     page_text = soup.get_text(separator=" ", strip=True)
     if len(page_text) >= JS_DETECTION_THRESHOLD:
         return soup, html
-
+ 
     print("(JS detected — retrying with Selenium...)", end=" ", flush=True)
     return fetch_html_selenium(url)
-
-
+ 
+ 
 def make_soup(html: str) -> BeautifulSoup:
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["style", "noscript", "svg", "iframe"]):
         tag.decompose()
     # NOTE: <script> tags are kept — JSON-LD and __NEXT_DATA__ live there.
     return soup
-
-
+ 
+ 
 def fetch_html_selenium(url: str) -> tuple[BeautifulSoup, str]:
     if not SELENIUM_AVAILABLE:
         raise ImportError(
             "Page appears JavaScript-rendered but Selenium is not installed.\n"
             "Run: pip install selenium webdriver-manager"
         )
-
+ 
     options = webdriver.ChromeOptions()
     for arg in ("--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled"):
         options.add_argument(arg)
     options.add_argument(f"user-agent={HEADERS['User-Agent']}")
-
+ 
     driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()), options=options,
     )
@@ -470,20 +478,20 @@ def fetch_html_selenium(url: str) -> tuple[BeautifulSoup, str]:
         html = driver.page_source
     finally:
         driver.quit()
-
+ 
     return make_soup(html), html
-
-
+ 
+ 
 def fetch_pdf_bytes(url: str) -> bytes:
     response = requests.get(url, headers=HEADERS, timeout=20)
     response.raise_for_status()
     return response.content
-
-
+ 
+ 
 # =============================================================================
 # TIER 1 — JSON-LD (schema.org)
 # =============================================================================
-
+ 
 def extract_jsonld(soup: BeautifulSoup, collector: RowCollector) -> int:
     count = 0
     for script in soup.find_all("script", type="application/ld+json"):
@@ -493,8 +501,8 @@ def extract_jsonld(soup: BeautifulSoup, collector: RowCollector) -> int:
             continue
         count += _walk_jsonld(data, collector)
     return count
-
-
+ 
+ 
 def _walk_jsonld(node, collector: RowCollector) -> int:
     count = 0
     if isinstance(node, list):
@@ -503,11 +511,11 @@ def _walk_jsonld(node, collector: RowCollector) -> int:
         return count
     if not isinstance(node, dict):
         return 0
-
+ 
     node_type = node.get("@type", "")
     types = node_type if isinstance(node_type, list) else [node_type]
     types = [t.lower() for t in types if isinstance(t, str)]
-
+ 
     if any(t in ("product", "menuitem", "menusection_item") for t in types):
         name = node.get("name", "")
         desc = node.get("description", "")
@@ -516,15 +524,15 @@ def _walk_jsonld(node, collector: RowCollector) -> int:
             price = node.get("price")
         if collector.add(str(name), price, description=str(desc or "")):
             count += 1
-
+ 
     # Recurse into every container key (itemListElement, hasMenuItem,
     # hasMenuSection, @graph, offers, mainEntity, ...)
     for value in node.values():
         if isinstance(value, (dict, list)):
             count += _walk_jsonld(value, collector)
     return count
-
-
+ 
+ 
 def _price_from_offers(offers):
     if offers is None:
         return None
@@ -537,23 +545,23 @@ def _price_from_offers(offers):
     if isinstance(offers, dict):
         return offers.get("price") or offers.get("lowPrice")
     return None
-
-
+ 
+ 
 # =============================================================================
 # TIER 2 — embedded framework JSON (__NEXT_DATA__ etc.)
 # =============================================================================
-
+ 
 NAME_KEYS  = {"name", "title", "productname", "displayname", "itemname", "label"}
 PRICE_KEYS = {"price", "currentprice", "sellprice", "nowprice", "amount",
               "priceamount", "value", "current"}
-
+ 
 EMBEDDED_JSON_RE = re.compile(
     r"(?:__NEXT_DATA__|__PRELOADED_STATE__|__INITIAL_STATE__|__APOLLO_STATE__)"
     r"[^=]*=\s*({.+?})\s*(?:;|</script>)",
     re.DOTALL,
 )
-
-
+ 
+ 
 def extract_embedded_json(soup: BeautifulSoup, collector: RowCollector) -> int:
     count = 0
     for script in soup.find_all("script"):
@@ -572,8 +580,8 @@ def extract_embedded_json(soup: BeautifulSoup, collector: RowCollector) -> int:
                 continue
             count += _walk_state(data, collector, depth=0)
     return count
-
-
+ 
+ 
 def _walk_state(node, collector: RowCollector, depth: int) -> int:
     if depth > 25:
         return 0
@@ -584,7 +592,7 @@ def _walk_state(node, collector: RowCollector, depth: int) -> int:
         return count
     if not isinstance(node, dict):
         return 0
-
+ 
     lower = {k.lower(): v for k, v in node.items()}
     name = next((lower[k] for k in NAME_KEYS if isinstance(lower.get(k), str)), None)
     # {"name": "brxsaas:offerPrices", "values": [...]} is attribute
@@ -605,23 +613,23 @@ def _walk_state(node, collector: RowCollector, depth: int) -> int:
                     break
             if price is not None:
                 break
-
+ 
     if name and price is not None:
         desc = next((lower[k] for k in ("description", "desc", "summary", "subtitle")
                      if isinstance(lower.get(k), str)), "")
         if collector.add(name, price, description=desc):
             count += 1
-
+ 
     for value in node.values():
         if isinstance(value, (dict, list)):
             count += _walk_state(value, collector, depth + 1)
     return count
-
-
+ 
+ 
 # =============================================================================
 # TIER 3 — microdata (itemprop attributes)
 # =============================================================================
-
+ 
 def extract_microdata(soup: BeautifulSoup, collector: RowCollector) -> int:
     count = 0
     for scope in soup.find_all(attrs={"itemtype": re.compile(r"(Product|MenuItem)", re.I)}):
@@ -633,16 +641,16 @@ def extract_microdata(soup: BeautifulSoup, collector: RowCollector) -> int:
         if collector.add(name_el.get_text(strip=True), price):
             count += 1
     return count
-
-
+ 
+ 
 # =============================================================================
 # TIER 4 — card-based DOM heuristic
 # =============================================================================
-
+ 
 def _visible_text(el: Tag) -> str:
     return el.get_text(separator=" ", strip=True)
-
-
+ 
+ 
 def _count_price_groups(el: Tag) -> int:
     """How many *distinct price-bearing leaf elements* live under el."""
     leaves = 0
@@ -654,8 +662,8 @@ def _count_price_groups(el: Tag) -> int:
     if leaves == 0 and PRICE_RE.search(_visible_text(el)):
         leaves = 1
     return leaves
-
-
+ 
+ 
 def _is_struck_through(el: Tag) -> bool:
     """Was-price detection: <del>/<s> tags or strike-y class names."""
     for node in [el] + list(el.parents):
@@ -669,8 +677,8 @@ def _is_struck_through(el: Tag) -> bool:
         if node.name in ("li", "article", "section", "body"):
             break
     return False
-
-
+ 
+ 
 def _classify_leaf(el: Tag, text: str) -> str:
     """Classify a price-bearing leaf: 'primary' | 'per_kg' | 'skip'."""
     lower = text.lower()
@@ -688,8 +696,8 @@ def _classify_leaf(el: Tag, text: str) -> str:
     if any(w in classes for w in ("per-unit", "ppu", "unit-price", "promo", "offer")):
         return "per_kg" if "unit" in classes or "ppu" in classes else "skip"
     return "primary"
-
-
+ 
+ 
 def _count_primary_leaves(el: Tag, primary_ids: set, primaries: list) -> int:
     """Count by IDENTITY: BeautifulSoup tags hash/compare by content, so
     identical-looking price tags collapse in a set — must use id()."""
@@ -699,19 +707,19 @@ def _count_primary_leaves(el: Tag, primary_ids: set, primaries: list) -> int:
         if leaf is el or any(id(p) == el_id for p in leaf.parents):
             n += 1
     return n
-
-
+ 
+ 
 def extract_cards(soup: BeautifulSoup, collector: RowCollector) -> int:
     body = soup.body or soup
     count = 0
-
+ 
     # Strip chrome regions — nav menus, headers, footers, cookie banners
     for chrome in body.select(
         "nav, header, footer, aside, "
         "[role='navigation'], [class*='breadcrumb' i], [class*='cookie' i]"
     ):
         chrome.decompose()
-
+ 
     # 1. collect price-bearing leaves and classify them
     primary, per_kg_leaves = [], []
     for el in body.find_all(True):
@@ -725,15 +733,15 @@ def extract_cards(soup: BeautifulSoup, collector: RowCollector) -> int:
             primary.append(el)
         elif kind == "per_kg":
             per_kg_leaves.append(el)
-
+ 
     primary_ids = {id(p) for p in primary}
     candidates = []
-
+ 
     for leaf in primary:
         leaf_text = _visible_text(leaf)
         m = PRICE_RE.search(leaf_text)
         price = m.group(0)
-
+ 
         # 2. card = smallest ancestor containing exactly ONE primary leaf
         card = leaf
         for ancestor in leaf.parents:
@@ -742,7 +750,7 @@ def extract_cards(soup: BeautifulSoup, collector: RowCollector) -> int:
             if _count_primary_leaves(ancestor, primary_ids, primary) > 1:
                 break
             card = ancestor
-
+ 
         # 3. name inside the card, else just before it
         fallback = False
         name = _name_from_card(card, leaf)
@@ -751,7 +759,7 @@ def extract_cards(soup: BeautifulSoup, collector: RowCollector) -> int:
             fallback = True
         if not name:
             continue
-
+ 
         # 4. attach a per-kg price if one lives in the same card
         per_kg_price = ""
         for aux in per_kg_leaves:
@@ -760,10 +768,10 @@ def extract_cards(soup: BeautifulSoup, collector: RowCollector) -> int:
                 if am:
                     per_kg_price = am.group(0)
                     break
-
+ 
         description = _description_from_card(card, name, leaf)
         candidates.append((name, price, per_kg_price, fallback, description))
-
+ 
     # A fallback name shared by 2+ different prices is a section header
     # ("Beef Meals", "Vegetarian Meals"...) — drop those rows entirely.
     from collections import defaultdict
@@ -771,21 +779,21 @@ def extract_cards(soup: BeautifulSoup, collector: RowCollector) -> int:
     for name, price, _, fb, _d in candidates:
         if fb:
             fallback_prices[clean_name(name).lower()].add(price)
-
+ 
     for name, price, per_kg_price, fb, description in candidates:
         if fb and len(fallback_prices[clean_name(name).lower()]) > 1:
             continue
         if collector.add(name, price, price_per_kg=per_kg_price,
                          description=description):
             count += 1
-
+ 
     return count
-
-
+ 
+ 
 def _tree_path_ids(el: Tag) -> list:
     return [id(p) for p in el.parents]
-
-
+ 
+ 
 def _lca_depth(a: Tag, b: Tag) -> int:
     """Depth of the lowest common ancestor of a and b — higher means the
     two elements are more tightly grouped (same product tile, not just
@@ -798,8 +806,8 @@ def _lca_depth(a: Tag, b: Tag) -> int:
             # convert "steps up from b" into absolute-ish depth score
             return -b_depth[pid]
     return -999
-
-
+ 
+ 
 def _name_from_card(card: Tag, price_leaf: Tag) -> str:
     """Choose the name candidate CLOSEST to the price leaf in the tree.
     Prevents a section heading (h2 'Mains') beating the product's own
@@ -823,14 +831,14 @@ def _name_from_card(card: Tag, price_leaf: Tag) -> str:
     idx = text.find(price_leaf.get_text(strip=True)[:20])
     candidate = clean_name(text[:idx] if idx > 0 else text)
     return candidate if valid_name(candidate) else ""
-
-
+ 
+ 
 DESC_SELECTORS = [
     '[class*="desc" i]', '[itemprop="description"]',
     '[class*="subtitle" i]', '[class*="summary" i]', "p", "small",
 ]
-
-
+ 
+ 
 def _description_from_card(card: Tag, name: str, price_leaf: Tag) -> str:
     """Best-effort description: a text element in the card that isn't
     the name and isn't the price."""
@@ -846,8 +854,8 @@ def _description_from_card(card: Tag, name: str, price_leaf: Tag) -> str:
                 continue
             return text[:300]
     return ""
-
-
+ 
+ 
 def _name_near_card(card: Tag) -> str:
     for sibling in card.find_previous_siblings():
         if not isinstance(sibling, Tag):
@@ -858,15 +866,15 @@ def _name_near_card(card: Tag) -> str:
         if valid_name(candidate):
             return candidate
     return ""
-
-
+ 
+ 
 # =============================================================================
 # HTML PIPELINE
 # =============================================================================
-
+ 
 def extract_from_html(soup, url, venue_name, location) -> list[dict]:
     collector = RowCollector(venue_name, location, url, "html_menu")
-
+ 
     tiers = [
         ("json-ld",   extract_jsonld),
         ("embedded",  extract_embedded_json),
@@ -881,14 +889,14 @@ def extract_from_html(soup, url, venue_name, location) -> list[dict]:
         # decent number of rows, skip the noisier DOM heuristic.
         if tier_name in ("json-ld", "embedded") and len(collector.rows) >= 5:
             break
-
+ 
     return collector.rows
-
-
+ 
+ 
 # =============================================================================
 # PDF PIPELINE
 # =============================================================================
-
+ 
 def _line_prices(line: str, use_bare: bool) -> list:
     """All price matches in a line: £-prefixed always; bare d.dd only in
     bare mode (menus that omit the currency symbol)."""
@@ -896,8 +904,8 @@ def _line_prices(line: str, use_bare: bool) -> list:
     if not matches and use_bare:
         matches = list(BARE_PRICE_RE.finditer(line))
     return matches
-
-
+ 
+ 
 def _is_section_header(line: str) -> bool:
     """ALL-CAPS short lines with no price are section headers.
     Must contain letters — otherwise bare price lines like "9" match,
@@ -907,8 +915,8 @@ def _is_section_header(line: str) -> bool:
             and bool(re.search(r"[A-Z]", s))
             and not BARE_PRICE_RE.search(s)
             and not INT_PRICE_LINE_RE.match(s))
-
-
+ 
+ 
 def _pdf_description(lines: list, idx: int, use_bare: bool) -> str:
     """The line after a priced item is its description if it carries no
     price of its own, isn't a section header, and looks like prose."""
@@ -922,8 +930,8 @@ def _pdf_description(lines: list, idx: int, use_bare: bool) -> str:
     if not re.search(r"[a-z]", nxt):      # no lowercase = header/decoration
         return ""
     return nxt
-
-
+ 
+ 
 def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
     """Line-based menu parsing. Handles £-prefixed and bare prices,
     multi-serve lines ("Glass 3.45 / Pint 4.30"), ABV/Kcal noise, and
@@ -933,7 +941,7 @@ def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
     pound_hits = sum(1 for ln in lines if PRICE_RE.search(ln))
     bare_hits  = sum(1 for ln in lines if BARE_PRICE_RE.search(ln))
     use_bare   = pound_hits < 3 and bare_hits >= 5
-
+ 
     count = 0
     for i, raw in enumerate(lines):
         line = re.sub(r"\.{2,}", " ", raw).strip()   # dotted leaders
@@ -942,20 +950,20 @@ def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
         prices = _line_prices(line, use_bare)
         if not prices:
             continue
-
+ 
         first = prices[0]
         has_kcal = bool(KCAL_RE.search(line))
         name = KCAL_RE.sub("", line[: first.start()]).strip(" -–|:,")
         if len(clean_name(name)) < MIN_NAME_LEN:
             continue
         description = _pdf_description(lines, i, use_bare)
-
+ 
         if len(prices) == 1:
             if collector.add(name, first.group(0), description=description,
                              force_food=has_kcal):
                 count += 1
             continue
-
+ 
         # strip every trailing serve label from the base name once,
         # so "DRAUGHT Glass 3.45 / Pint 4.30" -> base "DRAUGHT"
         base_name = name
@@ -967,7 +975,7 @@ def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
                 base_name = base_name[: m_tail.start()].strip(" -–|:,")
             else:
                 break
-
+ 
         # Multi-price line: "DRAUGHT Glass 3.45 / Pint 4.30" — pair each
         # price with the serve-size label immediately before it.
         prev_end = first.start()
@@ -982,36 +990,373 @@ def _extract_pdf_lines(lines: list, collector: RowCollector) -> int:
                              description=description, force_food=has_kcal):
                 count += 1
             prev_end = m.end()
-
+ 
     return count
-
-
+ 
+ 
+# =============================================================================
+# IMAGE MENUS — spatial OCR (multi-pass tesseract + geometry pairing)
+# Requires: pip install pytesseract pillow  +  apt install tesseract-ocr
+# =============================================================================
+ 
+PRICE_TOK_RE = re.compile(r"^£?\d{1,3}(?:\.\d{1,2})?$")
+def _mostly_caps(text: str) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    if not letters:
+        return False
+    return sum(c.isupper() for c in letters) / len(letters) >= 0.65
+ 
+def _harvest_words(img):
+    """Multi-pass OCR, merged + deduped by position. The 1x pass matters:
+    upscaling can DEGRADE isolated digits (price columns), while the 3x
+    pass helps small body text — so run both."""
+    passes = []
+    passes.append((img, 1, ""))
+    passes.append((img, 1, "--psm 11"))
+    big = ImageOps.autocontrast(ImageOps.grayscale(img).resize(
+        (img.width*3, img.height*3), Image.LANCZOS))
+    passes.append((big, 3, ""))
+    passes.append((big, 3, "--psm 11"))
+    # binarised full image — sharpens faint digits
+    gray = ImageOps.grayscale(img)
+    bw = gray.point(lambda px: 255 if px > 150 else 0)
+    passes.append((bw, 1, "--psm 11"))
+    # overlapping 3x3 tiles, sparse mode — tight crops rescue isolated
+    # digits that vanish in full-page segmentation
+    w, h = img.width, img.height
+    tw, th = w // 3, h // 3
+    for gy in range(3):
+        for gx in range(3):
+            x0, y0 = max(0, gx*tw - 40), max(0, gy*th - 40)
+            x1, y1 = min(w, (gx+1)*tw + 40), min(h, (gy+1)*th + 40)
+            crop = img.crop((x0, y0, x1, y1))
+            cbig = ImageOps.autocontrast(ImageOps.grayscale(crop).resize(
+                (crop.width*4, crop.height*4), Image.LANCZOS))
+            passes.append((cbig, 4, "--psm 11", (x0, y0)))
+ 
+    words, seen = [], []
+    for p in passes:
+        im, scale, cfg = p[0], p[1], p[2]
+        ox, oy = p[3] if len(p) > 3 else (0, 0)
+        d = pytesseract.image_to_data(im, config=cfg, output_type=Output.DICT)
+        for i in range(len(d["text"])):
+            t = d["text"][i].strip()
+            conf = int(d["conf"][i])
+            if not t or conf < 35:
+                continue
+            # junk guards: tiny noise tokens need higher confidence
+            if len(t) == 1 and not t.isdigit() and t != "&":
+                continue
+            if len(t) == 2 and not t.isdigit() and t != "&" and conf < 60:
+                continue
+            if not re.search(r"[A-Za-z0-9£&]", t):
+                continue
+            x = d["left"][i]//scale + ox
+            y = d["top"][i]//scale + oy
+            ww = d["width"][i]//scale
+            hh = d["height"][i]//scale
+            # dedupe on NORMALISED text + geometry:
+            #  - same word from another pass at a slight offset
+            #  - tile-cut fragments: "GHNUTS" inside "DOUGHNUTS"'s box
+            norm = re.sub(r"\W+", "", t).lower()
+            dup = False
+            for sx, sy, sw, sn in seen:
+                if abs(y - sy) > 12:
+                    continue
+                if abs(x - sx) < 26 and norm == sn:
+                    dup = True; break
+                if abs(x - sx) < 8:
+                    dup = True; break
+                # fragment check: this word starts inside an existing
+                # word's horizontal span and its text is a substring
+                if sx <= x <= sx + sw and norm and norm in sn:
+                    dup = True; break
+                # or the existing word is a fragment of this one — keep
+                # the longer one by replacing nothing (first wins is
+                # fine because full-image passes run before tiles)
+            if dup:
+                continue
+            seen.append((x, y, ww, norm))
+            words.append(dict(text=t, x=x, y=y, w=ww, h=hh))
+    return words
+ 
+def _rows(words):
+    """Cluster words into visual rows by y-centre."""
+    if not words:
+        return []
+    med_h = sorted(w["h"] for w in words)[len(words)//2]
+    tol = max(8, int(med_h * 0.7))
+    rows = []
+    for w in sorted(words, key=lambda w: w["y"] + w["h"]/2):
+        cy = w["y"] + w["h"]/2
+        for row in rows:
+            if abs(row["cy"] - cy) <= tol:
+                row["words"].append(w)
+                row["cy"] = sum(x["y"]+x["h"]/2 for x in row["words"])/len(row["words"])
+                break
+        else:
+            rows.append({"cy": cy, "words": [w]})
+    return rows, med_h
+ 
+def _segments(rows, gap=45):
+    """Split each row into segments on big x-gaps; split trailing price
+    tokens into their own segment."""
+    segs = []
+    for row in rows:
+        ws = sorted(row["words"], key=lambda w: w["x"])
+        cur = [ws[0]]
+        for w in ws[1:]:
+            prev = cur[-1]
+            if w["x"] - (prev["x"] + prev["w"]) > gap:
+                segs.append(_mk_seg(cur, row["cy"])); cur = [w]
+            else:
+                cur.append(w)
+        segs.append(_mk_seg(cur, row["cy"]))
+    out = []
+    for s in segs:
+        toks = s["text"].split()
+        if len(toks) > 1 and PRICE_TOK_RE.match(toks[-1]):
+            lastw = s["words"][-1]
+            if PRICE_TOK_RE.match(lastw["text"]):
+                name_words = s["words"][:-1]
+                out.append(_mk_seg(name_words, s["cy"]))
+                out.append(_mk_seg([lastw], s["cy"]))
+                continue
+        out.append(s)
+    return out
+ 
+def _mk_seg(words, cy):
+    return {"words": words, "cy": cy,
+            "x0": min(w["x"] for w in words),
+            "x1": max(w["x"]+w["w"] for w in words),
+            "text": " ".join(w["text"] for w in words),
+            "h": max(w["h"] for w in words)}
+ 
+def _second_chance_price(img, cx, cy, med_h, avoid_cys=()):
+    """OCR a single expected price cell that the main passes missed.
+    The crop is clamped to the midpoints toward the nearest known
+    prices above and below — geometrically excluding their digits, so
+    whatever is read can only belong to this row."""
+    top = cy - med_h * 1.9
+    bot = cy + med_h * 2.2          # wrapped items centre the price low
+    above = [a for a in avoid_cys if a < cy]
+    below = [a for a in avoid_cys if a > cy]
+    if above:
+        top = max(top, (cy + max(above)) / 2)
+    if below:
+        bot = min(bot, (cy + min(below)) / 2)
+    if bot - top < med_h:
+        return ""
+    box = (max(0, int(cx - 18)), max(0, int(top)),
+           min(img.width, int(cx + 46)), min(img.height, int(bot)))
+    crop = img.crop(box)
+    big = ImageOps.autocontrast(ImageOps.grayscale(crop).resize(
+        (crop.width * 6, crop.height * 6), Image.LANCZOS))
+    txt = pytesseract.image_to_string(
+        big, config="--psm 7 -c tessedit_char_whitelist=0123456789.£").strip()
+    txt = txt.strip(".£ ")
+    return txt if txt and PRICE_TOK_RE.match(txt) else ""
+ 
+ 
+def extract_image_menu(img):
+    words = _harvest_words(img)
+    rows, med_h = _rows(words)
+    segs = _segments(rows)
+ 
+    prices = [s for s in segs if PRICE_TOK_RE.match(s["text"])]
+    texts  = [s for s in segs if not PRICE_TOK_RE.match(s["text"])
+              and len(s["text"]) >= 3]
+ 
+    def name_ok(s):
+        """Display-size header text can't be an item name."""
+        return s["h"] <= med_h * 2.2
+ 
+    items = []
+    used_texts = set()
+    for p in sorted(prices, key=lambda s: s["cy"]):
+        pcx = (p["x0"]+p["x1"])/2
+        best, best_cost = None, None
+        for t in texts:
+            if id(t) in used_texts: continue
+            if not name_ok(t): continue
+            if t["x0"] > pcx: continue                  # name must start left of price
+            dy = abs(t["cy"] - p["cy"])
+            if dy > med_h*1.8: continue
+            dx = max(0, p["x0"] - t["x1"])
+            if dx > 460: continue
+            cost = dy*3 + dx*0.4
+            if best_cost is None or cost < best_cost:
+                best, best_cost = t, cost
+        if best is None: continue
+        used_texts.add(id(best))
+        items.append({"name_seg": best, "price": p["text"].lstrip("£")})
+ 
+    # post-pass A: lowercase desc carried the price -> real name is the
+    # ALLCAPS segment directly above, same column
+    for it in items:
+        s = it["name_seg"]
+        if re.search(r"[a-z]", s["text"]):
+            cands = [t for t in texts if id(t) not in used_texts
+                     and _mostly_caps(t["text"])
+                     and 0 < s["cy"] - t["cy"] <= med_h*2.6
+                     and t["x0"] < s["x1"] and t["x1"] > s["x0"]]
+            if cands:
+                up = min(cands, key=lambda t: s["cy"] - t["cy"])
+                used_texts.add(id(up))
+                it["desc"] = re.sub(r"\s*\d+(?:\.\d+)?\s*$", "", s["text"])
+                it["name_seg"] = up
+ 
+    # second-chance pass (runs LAST, leftovers only): a price COLUMN
+    # (>=3 prices sharing an x) implies aligned names should be priced.
+    # Re-OCR the exact missing cell, accepting only interior positions.
+    price_segs = [s for s in segs if PRICE_TOK_RE.match(s["text"])]
+    recovered_cys = []
+    cols = {}
+    for p in price_segs:
+        cols.setdefault(round(p["x0"] / 14), []).append(p)
+    for ps in cols.values():
+        if len(ps) < 3:
+            continue
+        col_x = sum(p["x0"] for p in ps) / len(ps)
+        y_lo, y_hi = min(p["cy"] for p in ps), max(p["cy"] for p in ps)
+        # panel = names of items already paired to THIS column's prices
+        panel_names = []
+        for it in items:
+            for p in ps:
+                if abs(it["name_seg"]["cy"] - p["cy"]) < med_h*1.5:
+                    panel_names.append(it["name_seg"]); break
+        if len(panel_names) < 2:
+            continue
+        nx_lo = min(n["x0"] for n in panel_names) - 12
+        nx_hi = max(n["x0"] for n in panel_names) + 60
+        for t in texts:
+            if id(t) in used_texts or not _mostly_caps(t["text"]) \
+                    or not name_ok(t):
+                continue
+            # strictly interior to the column, both axes
+            if not (nx_lo <= t["x0"] <= nx_hi and y_lo < t["cy"] < y_hi):
+                continue
+            avoid = [p["cy"] for p in ps] + recovered_cys
+            recovered = _second_chance_price(
+                img, col_x, t["cy"], med_h, avoid_cys=avoid)
+            if recovered:
+                used_texts.add(id(t))
+                items.append({"name_seg": t, "price": recovered})
+                # approximate digit position for later clamping
+                recovered_cys.append(t["cy"] + med_h * 0.8)
+ 
+    # post-pass B: merge wrapped continuation lines. When an unpriced
+    # segment has priced neighbours both above and below, language
+    # disambiguates: a generic tail word ("FRIES", "STICKS", "RINGS")
+    # CONTINUES the item above it; a distinctive word ("CRISSCROSS")
+    # STARTS a name whose price rides the next line.
+    TAIL_WORDS = {"FRIES", "STICKS", "STICK", "RING", "RINGS", "BITES",
+                  "CHIPS", "WINGS", "NUGGETS", "BREAD", "SAUCE", "ROLL",
+                  "ROLLS", "BALLS", "DOGS", "MEAL"}
+    for t in sorted(texts, key=lambda t: t["cy"]):
+        if id(t) in used_texts or not _mostly_caps(t["text"]) or not name_ok(t):
+            continue
+        above, below = None, None
+        for it in items:
+            s = it["name_seg"]
+            if not _mostly_caps(s["text"]): continue
+            if not (t["x0"] < s["x1"] and t["x1"] > s["x0"]): continue
+            dy = t["cy"] - s["cy"]
+            if abs(dy) > med_h*3.0: continue
+            if dy > 0 and (above is None or dy < t["cy"]-above["name_seg"]["cy"]):
+                above = it
+            if dy < 0 and (below is None or -dy < below["name_seg"]["cy"]-t["cy"]):
+                below = it
+        if above and below:
+            is_tail = t["text"].strip().upper() in TAIL_WORDS
+            best = above if is_tail else below
+        else:
+            best = above or below
+        if best is None:
+            continue
+        used_texts.add(id(t))
+        s = best["name_seg"]
+        if t["cy"] < s["cy"]:      # continuation above -> prepend
+            best["name_seg"] = _mk_seg(t["words"] + s["words"], s["cy"])
+        else:                      # below -> append
+            best["name_seg"] = _mk_seg(s["words"] + t["words"], s["cy"])
+ 
+    # post-pass C: attach lowercase description right below the name
+    for it in items:
+        if it.get("desc"): continue
+        s = it["name_seg"]
+        for t in texts:
+            if id(t) in used_texts: continue
+            if not re.search(r"[a-z]", t["text"]): continue
+            same_col = t["x0"] < s["x1"]+50 and t["x1"] > s["x0"]-50
+            if same_col and 0 < t["cy"] - s["cy"] <= med_h*2.4:
+                it["desc"] = t["text"]; used_texts.add(id(t)); break
+ 
+    out = []
+    UPSELL_RE = re.compile(r"^(add|with|served|choose|both|all of|please)\b", re.I)
+    for it in items:
+        name = it["name_seg"]["text"]
+        if UPSELL_RE.match(name) and re.search(r"[a-z]", name):
+            continue
+        while re.search(r"\s+\b[a-z]{1,3}[.,=]?\s*$", name):   # OCR'd diet tags
+            name = re.sub(r"\s+\b[a-z]{1,3}[.,=]?\s*$", "", name)
+        name = re.sub(r"\s+[=|•·]+\s*", " ", name)
+        name = re.sub(r"\b(\w+)([,.]?\s+\1\b)+", r"\1", name, flags=re.I)
+        desc = it.get("desc", "")
+        desc = re.sub(r"\b(\w+)([,.]?\s+\1\b)+", r"\1", desc, flags=re.I)
+        it["desc"] = desc.strip(" '‘,.")
+        out.append((name.strip(" .,|-"), it["price"], it.get("desc","")))
+    return out
+ 
+ 
+ 
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")
+ 
+ 
+def is_image(url: str) -> bool:
+    return url.lower().split("?")[0].endswith(IMAGE_EXTS)
+ 
+ 
+def extract_from_image(img, url, venue_name, location,
+                       source_type="image_menu") -> list[dict]:
+    if not OCR_AVAILABLE:
+        raise ImportError(
+            "Image menu found but OCR is not installed.\n"
+            "Run: pip install pytesseract pillow\n"
+            "And install the engine: sudo apt install tesseract-ocr"
+        )
+    collector = RowCollector(venue_name, location, url, source_type)
+    for name, price, desc in extract_image_menu(img):
+        collector.add(name, price, description=desc)
+    return collector.rows
+ 
+ 
 NOISE_LINE_RE = re.compile(
     r"per portion|service charge|allergen|calories|registered charity|"
     r"subject to change|gluten free|please|look out for|goes directly",
     re.IGNORECASE,
 )
-
-
+ 
+ 
 def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
     """Block-style menus where the price is a bare integer on its own
     line AFTER the name and description:
-
+ 
         Buffalo V NGC          <- name
         Ranch dressing         <- description
         9                      <- price
-
+ 
     Also handles inline integers ("Waffle fries Ve NGC 5"), dual prices
     ("7 / 12"), and two-column extraction artefacts where the previous
     item's price fuses onto the next name ("7 Sweet tooth brioche buns").
     """
     count = 0
     pend_name, pend_desc = "", []
-
+ 
     def reset():
         nonlocal pend_name, pend_desc
         pend_name, pend_desc = "", []
-
+ 
     def close(prices, sizes=None):
         nonlocal count
         if not pend_name:
@@ -1022,7 +1367,7 @@ def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
             if collector.add(pend_name, p, size=size, description=desc):
                 count += 1
         reset()
-
+ 
     for raw in lines:
         line = raw.strip()
         if not line:
@@ -1034,14 +1379,14 @@ def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
         if _is_section_header(line):
             reset()
             continue
-
+ 
         # "9"  or  "7 / 12"  alone on the line -> closes the pending item
         m = INT_PRICE_LINE_RE.match(line)
         if m:
             prices = [m.group(1)] + ([m.group(2)] if m.group(2) else [])
             close(prices)
             continue
-
+ 
         # "7 Sweet tooth brioche buns V" -> price 7 closes pending,
         # remainder starts the next item
         m = LEADING_INT_RE.match(line)
@@ -1051,7 +1396,7 @@ def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
             if line:
                 pend_name = line
             continue
-
+ 
         # "Waffle fries Ve NGC 5" -> complete single-line item
         m = TRAILING_INT_RE.search(line)
         if m and not pend_name:
@@ -1067,7 +1412,7 @@ def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
             if collector.add(name_part, m.group(1)):
                 count += 1
             continue
-
+ 
         # £-prices on a text line still work in block menus
         pm = PRICE_RE.search(line)
         if pm:
@@ -1077,7 +1422,7 @@ def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
                 if collector.add(name_part, pm.group(0)):
                     count += 1
             continue
-
+ 
         # otherwise: first text line = name, later ones = description
         if not pend_name:
             pend_name = line
@@ -1085,17 +1430,17 @@ def _extract_pdf_blocks(lines: list, collector: RowCollector) -> int:
             pend_desc.append(line)
             if len(pend_desc) > 3:        # runaway block, not an item
                 reset()
-
+ 
     return count
-
-
+ 
+ 
 def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
     collector = RowCollector(venue_name, location, url, "pdf_menu")
-
+ 
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             page_found = 0
-
+ 
             for table in page.extract_tables() or []:
                 for row in table:
                     if not row:
@@ -1107,12 +1452,24 @@ def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
                     name = row_text[: row_text.find(m.group(0))]
                     if collector.add(name, m.group(0)):
                         page_found += 1
-
+ 
             if page_found:        # per-PAGE check
                 continue
-
-            lines = (page.extract_text() or "").splitlines()
-
+ 
+            raw_text = page.extract_text() or ""
+ 
+            # Scanned / image-only page: no text layer -> rasterise + OCR
+            if len(raw_text.strip()) < 40 and OCR_AVAILABLE:
+                try:
+                    pil = page.to_image(resolution=150).original
+                    for name, price, desc in extract_image_menu(pil):
+                        collector.add(name, price, description=desc)
+                    continue
+                except Exception:
+                    pass
+ 
+            lines = raw_text.splitlines()
+ 
             # Choose parser: block mode when the page is full of
             # standalone-integer price lines and (almost) no £ / d.dd
             pound = sum(1 for ln in lines if PRICE_RE.search(ln))
@@ -1123,19 +1480,19 @@ def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
                 _extract_pdf_blocks(lines, collector)
             else:
                 _extract_pdf_lines(lines, collector)
-
+ 
     return collector.rows
-
-
+ 
+ 
 # =============================================================================
 # CSV I/O  (unchanged from v1 apart from minor cleanup)
 # =============================================================================
-
+ 
 def load_venues(csv_path: str) -> list[dict]:
     path = Path(csv_path)
     if not path.exists():
         raise FileNotFoundError(f"Input file not found: {csv_path}")
-
+ 
     venues = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -1158,8 +1515,8 @@ def load_venues(csv_path: str) -> list[dict]:
             venues.append({"venue_name": venue_name, "url": url,
                            "locations": locations})
     return venues
-
-
+ 
+ 
 def save_rows(rows: list[dict], output_path: Path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_header = not output_path.exists() or output_path.stat().st_size == 0
@@ -1169,20 +1526,86 @@ def save_rows(rows: list[dict], output_path: Path):
         if write_header:
             writer.writeheader()
         writer.writerows(rows)
-
-
+ 
+ 
 # =============================================================================
 # MAIN
 # =============================================================================
-
+ 
+SKIP_IMG_RE = re.compile(r"logo|icon|sprite|avatar|favicon|badge|social|"
+                         r"payment|arrow|banner", re.IGNORECASE)
+ 
+ 
+def _img_candidates(soup, base_url):
+    """Rank <img> tags by likelihood of being a menu image.
+ 
+    Pass 1: src/alt mentions 'menu'.  Pass 2 (only if pass 1 is empty):
+    any content image, largest declared dimensions first.  Lazy-load
+    attributes and srcset are honoured; obvious chrome (logos, icons,
+    social badges) is skipped.
+    """
+    hinted, generic = [], []
+    for im in soup.find_all("img"):
+        cand = (im.get("src") or im.get("data-src")
+                or im.get("data-lazy-src") or "")
+        if not cand and im.get("srcset"):
+            # srcset: take the last (usually largest) URL
+            cand = im["srcset"].split(",")[-1].strip().split(" ")[0]
+        if not cand:
+            continue
+        path = cand.lower().split("?")[0]
+        if not path.endswith(IMAGE_EXTS):
+            continue
+        hint = (cand + " " + (im.get("alt") or "") + " "
+                + " ".join(im.get("class") or [])).lower()
+        if SKIP_IMG_RE.search(hint):
+            continue
+        try:
+            w = int(re.sub(r"\D", "", str(im.get("width") or 0)) or 0)
+            h = int(re.sub(r"\D", "", str(im.get("height") or 0)) or 0)
+        except ValueError:
+            w = h = 0
+        if 0 < w < 200 or 0 < h < 200:      # declared tiny = chrome
+            continue
+        full = requests.compat.urljoin(base_url, cand)
+        if "menu" in hint:
+            hinted.append((w * h, full))
+        else:
+            generic.append((w * h, full))
+    pool = hinted or generic
+    pool.sort(key=lambda t: -t[0])           # biggest first, 0-area last
+    seen, out = set(), []
+    for _, u in pool:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out[:3]
+ 
+ 
+def ocr_page_images(soup, url, venue_name, location) -> list[dict]:
+    rows = []
+    for iu in _img_candidates(soup, url):
+        try:
+            r = requests.get(iu, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            pil = Image.open(io.BytesIO(r.content))
+            if pil.width < 400:              # actual tiny image: skip
+                continue
+            print(f"(OCR {iu.rsplit('/',1)[-1]}...)", end=" ", flush=True)
+            rows += extract_from_image(pil, iu, venue_name, location)
+        except Exception:
+            continue
+    return rows
+ 
+ 
 def main():
     output_path = OUTPUT_DIR / f"raw_pricing_{TODAY}.csv"
-
+ 
     # Fresh file every run — appending across runs mixes old bad rows
     # with new ones and creates duplicates.
     if output_path.exists():
         output_path.unlink()
-
+ 
     print()
     print("=" * 60)
     print("  IH Solutions — Competitor Pricing Scraper v2")
@@ -1192,34 +1615,41 @@ def main():
     print(f"  Date   : {TODAY}")
     print("=" * 60)
     print()
-
+ 
     try:
         venues = load_venues(INPUT_CSV)
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
-
+ 
     if not venues:
         print("No valid venues found in the CSV. Nothing to do.")
         return
-
+ 
     print(f"Loaded {len(venues)} venue(s)\n")
-
+ 
     total_rows, errors = 0, []
-
+ 
     for i, venue in enumerate(venues, start=1):
         name, url = venue["venue_name"], venue["url"]
         locations = venue["locations"]
         location = locations[0]          # scrape under the first location
         pdf = is_pdf(url)
-
+ 
         print(f"[{i}/{len(venues)}]  {name}")
         print(f"  url       : {url}")
         print(f"  locations : {', '.join(locations)}")
         print(f"  type      : {'pdf_menu' if pdf else 'html_menu'}")
-
+ 
         try:
-            if pdf:
+            if is_image(url):
+                print("  fetching image...", end=" ", flush=True)
+                resp = requests.get(url, headers=HEADERS, timeout=20)
+                resp.raise_for_status()
+                img = Image.open(io.BytesIO(resp.content))
+                print("OCR...", end=" ", flush=True)
+                rows = extract_from_image(img, url, name, location)
+            elif pdf:
                 print("  fetching PDF...", end=" ", flush=True)
                 rows = extract_from_pdf(fetch_pdf_bytes(url), url, name, location)
             else:
@@ -1227,14 +1657,22 @@ def main():
                 soup, _ = fetch_html(url)
                 print("extracting...", end=" ", flush=True)
                 rows = extract_from_html(soup, url, name, location)
-
+ 
+                # No rows but the page embeds images? OCR the most
+                # likely menu candidates.
+                if not rows and OCR_AVAILABLE:
+                    rows += ocr_page_images(soup, url, name, location)
+ 
                 # Structured tiers found nothing AND DOM found nothing,
                 # but the page had text? Probably a JS skeleton — retry.
                 if not rows and SELENIUM_AVAILABLE:
                     print("(0 rows — retrying with Selenium...)", end=" ", flush=True)
                     soup, _ = fetch_html_selenium(url)
                     rows = extract_from_html(soup, url, name, location)
-
+                    # the rendered page may reveal the menu images too
+                    if not rows and OCR_AVAILABLE:
+                        rows += ocr_page_images(soup, url, name, location)
+ 
             # Fan out: one copy of every row per location. The menu is
             # fetched once; only the location column differs.
             if rows and len(locations) > 1:
@@ -1245,17 +1683,17 @@ def main():
                         r["location"] = loc
                         expanded.append(r)
                 rows = expanded
-
+ 
             print(f"{len(rows)} rows"
                   + (f" ({len(locations)} locations)" if len(locations) > 1 else ""))
-
+ 
             if rows:
                 save_rows(rows, output_path)
                 total_rows += len(rows)
             else:
                 print("  ⚠  No priced items found — check the URL points at an "
                       "actual menu/listing page, not a landing page")
-
+ 
         except requests.exceptions.HTTPError as e:
             msg = f"HTTP {e.response.status_code}"
             print(f"failed — {msg}")
@@ -1269,11 +1707,11 @@ def main():
         except Exception as e:
             print(f"failed — {e}")
             errors.append({"venue": name, "error": str(e)})
-
+ 
         print()
         if i < len(venues):
             time.sleep(2)
-
+ 
     print("=" * 60)
     print(f"  Venues processed : {len(venues)}")
     print(f"  Rows collected   : {total_rows}")
@@ -1281,15 +1719,52 @@ def main():
     if total_rows:
         print(f"  Saved to         : {output_path}")
     print("=" * 60)
-
+ 
     if errors:
         print("\nFailed venues:")
         for err in errors:
             print(f"  ✗  {err['venue']} — {err['error']}")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
