@@ -1,5 +1,5 @@
-venue_name, url, location, js_render
-Hollywood Bowl, https://www.hollywoodbowl.co.uk/food-and-drink, leeds , 
-Superbowl, https://www.superbowluk.co.uk/wp-content/uploads/sites/33/2025/11/6219903-MAIN-MENU.pdf, London, 
-Waitrose, https://www.waitrose.com/ecom/shop/search?&sortBy=RELEVANCE&ct=Meal, London, 
-Cookfood, https://www.cookfood.net/menu/main-meals/meals-for-1, Dundee, 
+venue_name, url, location
+Hollywood Bowl, https://www.hollywoodbowl.co.uk/food-and-drink, leeds 
+Superbowl, https://www.superbowluk.co.uk/wp-content/uploads/sites/33/2025/11/6219903-MAIN-MENU.pdf, London
+Cookfood, https://www.cookfood.net/menu/main-meals/meals-for-1 ,  Dundee
+Bills, https://bills-website.co.uk/menus/, Conventry
