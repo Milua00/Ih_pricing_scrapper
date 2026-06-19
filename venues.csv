@@ -1,8 +1,9 @@
-venue_name, url, location
-Hollywood Bowl, https://www.hollywoodbowl.co.uk/food-and-drink, leeds 
-Superbowl, https://www.superbowluk.co.uk/wp-content/uploads/sites/33/2025/11/6219903-MAIN-MENU.pdf, London
-Cookfood, https://www.cookfood.net/menu/main-meals/meals-for-1 ,  Dundee
-East Street Lanes,https://eaststreetlanes.b-cdn.net/wp-content/uploads/2026/05/food-menu.jpeg,Leciester
-Lane7, https://lane7.com/wp-content/uploads/2026/04/17419_Lane-7_April-Drinks-Menus_Lane7_T2.pdf, Arberdeen
-Electric shuffle, https://electricshuffle.com/uk/files/menus/electric-shuffle-food-menu.pdf, Manchester
-Electric shuffle, https://electricshuffle.com/uk/files/menus/electric-shuffle-regional-drinks-menu.pdf, Manchester
+venue_name, url, location,postcode_area, note
+Hollywood Bowl, https://www.hollywoodbowl.co.uk/food-and-drink, leeds, M
+Superbowl, https://www.superbowluk.co.uk/wp-content/uploads/sites/33/2025/11/6219903-MAIN-MENU.pdf, London, M
+Cookfood, https://www.cookfood.net/menu/main-meals/meals-for-1 ,  Dundee, M
+East Street Lanes,https://eaststreetlanes.b-cdn.net/wp-content/uploads/2026/05/food-menu.jpeg,Leciester, M, "MEN AT WORK"
+Lane7, https://lane7.com/wp-content/uploads/2026/04/17419_Lane-7_April-Drinks-Menus_Lane7_T2.pdf, Arberdeen, M
+Electric shuffle, https://electricshuffle.com/uk/files/menus/electric-shuffle-food-menu.pdf, Manchester, M, "TEST FODD AND , DRKIN"
+Electric shuffle, https://electricshuffle.com/uk/files/menus/electric-shuffle-regional-drinks-menu.pdf, Manchester, M, "Test1"
+Roxy Lanes, https://roxyleisure.co.uk/menu/manchester-arndale-menu/#gf_12, Manchester; London; Dundee | Newcastle, M,  "Proud"

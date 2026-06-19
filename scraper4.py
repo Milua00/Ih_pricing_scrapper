@@ -57,6 +57,22 @@ try:
 except ImportError:
     SELENIUM_AVAILABLE = False
 
+import os
+import uuid
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+
+load_dotenv()
+DB_URL = os.getenv("SUPABASE_DB_URL")
+
+# Map each distinct location string your scraper emits to its postcode area letters
+POSTCODE_AREAS = {
+    "Manchester": "M",
+    "Leeds":      "LS",
+    "Bristol":    "BS",
+    # ...one entry per distinct location value in your data
+}
 
 # =============================================================================
 # CONFIG
@@ -123,7 +139,7 @@ NAME_SELECTORS = [
 ]
 
 OUTPUT_COLUMNS = [
-    "venue_name", "brand", "location", "food_item", "price",
+    "venue_name", "brand", "location", "postcode_area", "food_item", "price",
     "price_per_kg", "size", "is_drink", "type", "drink_item",
     "source_type", "source_url", "ingestion_date", "note",
 ]
@@ -1602,6 +1618,22 @@ def ocr_page_images(soup, url, venue_name, location) -> list[dict]:
             continue
     return rows
 
+def upload_to_supabase(rows: list[dict], run_id: str) -> None:
+    if not DB_URL:
+        print("  [Supabase] No SUPABASE_DB_URL set — skipping upload")
+        return
+    try:
+        engine = create_engine(
+            DB_URL,
+            connect_args={"sslmode": "require", "connect_timeout": 10},
+            pool_pre_ping=True,
+        )
+        df = pd.DataFrame(rows)
+        df["scrape_run_id"] = run_id
+        df.to_sql("raw_pricing", engine, if_exists="append", index=False)
+        print(f"  [Supabase] Uploaded {len(df)} rows (run_id: {run_id})")
+    except Exception as e:
+        print(f"  [Supabase] Upload failed — {e}")
 
 def main():
     output_path = OUTPUT_DIR / f"raw_pricing_{TODAY}.csv"
@@ -1634,6 +1666,9 @@ def main():
     print(f"Loaded {len(venues)} venue(s)\n")
 
     total_rows, errors = 0, []
+    run_id = str(uuid.uuid4())
+    all_rows = []
+    
 
     for i, venue in enumerate(venues, start=1):
         name, url = venue["venue_name"], venue["url"]
@@ -1699,6 +1734,7 @@ def main():
             if rows:
                 save_rows(rows, output_path)
                 total_rows += len(rows)
+                all_rows.extend(rows)
             else:
                 print("  ⚠  No priced items found — check the URL points at an "
                       "actual menu/listing page, not a landing page")
@@ -1728,6 +1764,9 @@ def main():
     if total_rows:
         print(f"  Saved to         : {output_path}")
     print("=" * 60)
+    
+    if all_rows:
+        upload_to_supabase(all_rows, run_id)
 
     if errors:
         print("\nFailed venues:")
