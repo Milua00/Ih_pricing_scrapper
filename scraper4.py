@@ -1503,6 +1503,10 @@ def extract_from_pdf(pdf_bytes, url, venue_name, location) -> list[dict]:
 # =============================================================================
 # CSV I/O  (unchanged from v1 apart from minor cleanup)
 # =============================================================================
+def postcode_area_of(code: str) -> str:
+    """'M1 4WX' / 'm1' / 'M' -> 'M';  'SW1A' -> 'SW'."""
+    m = re.match(r"\s*([A-Za-z]{1,2})", code or "")
+    return m.group(1).upper() if m else ""
 
 def load_venues(csv_path: str) -> list[dict]:
     path = Path(csv_path)
@@ -1530,10 +1534,20 @@ def load_venues(csv_path: str) -> list[dict]:
             # e.g.  "Newcastle; Leeds; Manchester"
             locations = [loc.strip() for loc in re.split(r"[;|]", location)
                          if loc.strip()]
+
+            # Postcode area per location, aligned by position with `locations`
+            postcode = row.get("postcode") or row.get("postcode_area") or ""
+            areas = [postcode_area_of(a) for a in re.split(r"[;|]", postcode)]
+            postcode_areas = {
+                loc: (areas[k] if k < len(areas) else "")
+                for k, loc in enumerate(locations)
+            }
+
             venue_name = (row.get("venue_name") or row.get("name")
                           or url.split("/")[2])
             venues.append({"venue_name": venue_name, "url": url,
                            "locations": locations,
+                           "postcode_areas": postcode_areas,
                            "note": row.get("note", "")})
     return venues
 
@@ -1732,6 +1746,9 @@ def main():
                   + (f" ({len(locations)} locations)" if len(locations) > 1 else ""))
 
             if rows:
+                loc_area = venue["postcode_areas"]
+                for r in rows:
+                    r["postcode_area"] = loc_area.get(r["location"], "")
                 save_rows(rows, output_path)
                 total_rows += len(rows)
                 all_rows.extend(rows)
